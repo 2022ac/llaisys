@@ -217,14 +217,14 @@ tensor_t Tensor::view(const std::vector<size_t> &shape) const {
     // 步长为(30, 10, 1)的张量。你还能在不传输数据的情况下将其重塑为(2, 15)吗？
 
     // 打印输入形状
-    std::cout << "DEBUG: view called with shape: [";
-    for (size_t i = 0; i < shape.size(); ++i) {
-        std::cout << shape[i];
-        if (i < shape.size() - 1) {
-            std::cout << ", ";
-        }
-    }
-    std::cout << "]" << std::endl;
+    // std::cout << "DEBUG: view called with shape: [";
+    // for (size_t i = 0; i < shape.size(); ++i) {
+    //     std::cout << shape[i];
+    //     if (i < shape.size() - 1) {
+    //         std::cout << ", ";
+    //     }
+    // }
+    // std::cout << "]" << std::endl;
     // 计算新形状的总元素数
     size_t new_numel = 1;
     for (size_t s : shape) {
