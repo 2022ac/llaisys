@@ -6,6 +6,7 @@ from ..libllaisys import (
     LlaisysQwen2Meta,
     LlaisysQwen2Weights,
     llaisysQwen2Model_t,
+    llaisysQwen2Session_t,
     llaisysDeviceType_t,
 )
 from ..tensor import Tensor
@@ -17,6 +18,78 @@ from safetensors import safe_open
 import json
 import numpy as np
 import torch
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Qwen2Session: 封装每用户独立的 KV-Cache 状态
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Qwen2Session:
+    """
+    每个用户对话独占一个 Qwen2Session，持有独立的 KV-Cache。
+    多个 Session 可并发绑定到同一个 Qwen2 模型（权重只读共享）。
+    """
+
+    def __init__(self, model: "Qwen2"):
+        self._model = model
+        self._sess = LIB_LLAISYS.llaisysQwen2SessionCreate(model._model)
+        if self._sess is None:
+            raise RuntimeError("llaisysQwen2SessionCreate returned null")
+        self._meta = model._meta
+        self._device = model._device
+        # 前缀复用：记录当前 KV-Cache 对应的完整 token 序列
+        self._cached_tokens: list = []
+
+    # ── 基础属性 ────────────────────────────────────────────────────────────
+
+    @property
+    def cache_pos(self) -> int:
+        return LIB_LLAISYS.llaisysQwen2SessionGetCachePos(self._sess)
+
+    @cache_pos.setter
+    def cache_pos(self, pos: int):
+        LIB_LLAISYS.llaisysQwen2SessionSetCachePos(self._sess, c_size_t(pos))
+
+    def reset_cache(self):
+        LIB_LLAISYS.llaisysQwen2SessionResetCache(self._sess)
+        self._cached_tokens = []
+
+    # ── 推理 ─────────────────────────────────────────────────────────────────
+
+    def _infer_sample(self, token_ids: list, temperature: float, top_k: int, top_p: float) -> int:
+        LIB_LLAISYS.llaisysSetContextRuntime(llaisysDeviceType_t(self._device.value), c_int(0))
+        arr = (c_int64 * len(token_ids))(*token_ids)
+        return LIB_LLAISYS.llaisysQwen2SessionInferSample(
+            self._model._model, self._sess, arr, len(token_ids),
+            c_float(temperature), c_int(top_k), c_float(top_p)
+        )
+
+    def stream_generate(
+        self,
+        inputs: Sequence[int],
+        max_new_tokens: int = 512,
+        top_k: int = 50,
+        top_p: float = 0.9,
+        temperature: float = 0.8,
+    ):
+        """Generator: yield 新生成的 token IDs（不含 prompt 部分）。"""
+        if not inputs:
+            return
+
+        next_token = self._infer_sample(list(inputs), temperature, top_k, top_p)
+        yield next_token
+
+        max_new = max_new_tokens if max_new_tokens is not None else 512
+        for _ in range(max_new - 1):
+            if next_token == self._meta.end_token:
+                break
+            next_token = self._infer_sample([next_token], temperature, top_k, top_p)
+            yield next_token
+
+    def __del__(self):
+        if hasattr(self, "_sess") and self._sess is not None:
+            LIB_LLAISYS.llaisysQwen2SessionDestroy(self._sess)
+            self._sess = None
 
 
 class Qwen2:
@@ -166,6 +239,10 @@ class Qwen2:
             else:
                 print(f"WARNING: Unmatched weight name: {name}")
 
+
+    def create_session(self) -> Qwen2Session:
+        """创建一个新的独立会话（每用户 KV-Cache 隔离）。"""
+        return Qwen2Session(self)
 
     def generate(
         self,

@@ -48,6 +48,31 @@ static float f16_to_f32(uint16_t h) {
     return result;
 }
 
+// ─── 每用户 Session：独立 KV-Cache + 采样状态 ────────────────────────────────
+// 权重只读共享，多个 Session 可并发操作同一 Qwen2Model 而互不干扰。
+struct Qwen2Session {
+    LlaisysQwen2Meta meta; // 模型 metadata 副本（用于分配 tensor）
+    llaisysDeviceType_t device;
+    std::vector<tensor_t> k_cache;
+    std::vector<tensor_t> v_cache;
+    size_t cache_pos = 0;
+    std::mt19937 rng;
+
+    Qwen2Session(const LlaisysQwen2Meta &m, llaisysDeviceType_t dev)
+        : meta(m), device(dev), cache_pos(0), rng(std::random_device{}()) {
+        k_cache.resize(meta.nlayer);
+        v_cache.resize(meta.nlayer);
+        for (size_t i = 0; i < meta.nlayer; i++) {
+            k_cache[i] = Tensor::create({meta.maxseq, meta.nkvh, meta.dh}, meta.dtype, device);
+            v_cache[i] = Tensor::create({meta.maxseq, meta.nkvh, meta.dh}, meta.dtype, device);
+        }
+    }
+
+    void reset() { cache_pos = 0; }
+    void set_pos(size_t pos) { cache_pos = pos; }
+    size_t get_pos() const { return cache_pos; }
+};
+
 struct Qwen2Model {
     LlaisysQwen2Meta meta;
     llaisysDeviceType_t device;
@@ -69,14 +94,11 @@ struct Qwen2Model {
     std::vector<tensor_t> mlp_up_w;
     std::vector<tensor_t> mlp_down_w;
 
-    // KV Cache
-    std::vector<tensor_t> k_cache;
-    std::vector<tensor_t> v_cache;
-    size_t cache_pos;
-    std::mt19937 rng;
+    // 向后兼容的默认会话（单用户接口通过此 session 操作）
+    std::unique_ptr<Qwen2Session> default_session;
 
     Qwen2Model(const LlaisysQwen2Meta &m, llaisysDeviceType_t dev)
-        : meta(m), device(dev), cache_pos(0), rng(std::random_device{}()) {
+        : meta(m), device(dev) {
         // Create embedding and output tensors
         in_embed = Tensor::create({meta.voc, meta.hs}, meta.dtype, device);
         out_embed = Tensor::create({meta.voc, meta.hs}, meta.dtype, device);
@@ -112,24 +134,19 @@ struct Qwen2Model {
             mlp_down_w[i] = Tensor::create({meta.hs, meta.di}, meta.dtype, device);
         }
 
-        // Initialize KV cache
-        k_cache.resize(meta.nlayer);
-        v_cache.resize(meta.nlayer);
-        for (size_t i = 0; i < meta.nlayer; i++) {
-            k_cache[i] = Tensor::create({meta.maxseq, meta.nkvh, meta.dh}, meta.dtype, device);
-            v_cache[i] = Tensor::create({meta.maxseq, meta.nkvh, meta.dh}, meta.dtype, device);
-        }
+        // 创建默认会话（向后兼容单用户接口）
+        default_session = std::make_unique<Qwen2Session>(m, dev);
     }
 
-    // 运行完整前向传播，更新 cache_pos，返回设备端 logits [voc]
-    tensor_t run_forward(int64_t *token_ids, size_t ntoken) {
+    // 运行完整前向传播，更新 sess.cache_pos，返回设备端 logits [voc]
+    tensor_t run_forward(Qwen2Session &sess, int64_t *token_ids, size_t ntoken) {
         size_t seq_len = ntoken;
 
         // Create position ids
         auto pos_ids = Tensor::create({seq_len}, LLAISYS_DTYPE_I64, device);
         std::vector<int64_t> pos_data(seq_len);
         for (size_t i = 0; i < seq_len; i++) {
-            pos_data[i] = cache_pos + i;
+            pos_data[i] = static_cast<int64_t>(sess.cache_pos) + static_cast<int64_t>(i);
         }
         pos_ids->load(pos_data.data());
 
@@ -169,8 +186,8 @@ struct Qwen2Model {
             for (size_t i = 0; i < seq_len; i++) {
                 auto k_slice = k_rope->slice(0, i, i + 1);
                 auto v_slice = v_shaped->slice(0, i, i + 1);
-                auto k_cache_slice = k_cache[layer]->slice(0, cache_pos + i, cache_pos + i + 1);
-                auto v_cache_slice = v_cache[layer]->slice(0, cache_pos + i, cache_pos + i + 1);
+                auto k_cache_slice = sess.k_cache[layer]->slice(0, sess.cache_pos + i, sess.cache_pos + i + 1);
+                auto v_cache_slice = sess.v_cache[layer]->slice(0, sess.cache_pos + i, sess.cache_pos + i + 1);
 
                 // Flatten to 1D and perform D2D copy
                 auto k_flat = k_slice->view({meta.nkvh * meta.dh});
@@ -186,9 +203,9 @@ struct Qwen2Model {
             }
 
             // Get full KV from cache
-            size_t total_len = cache_pos + seq_len;
-            auto k_full = k_cache[layer]->slice(0, 0, total_len);
-            auto v_full = v_cache[layer]->slice(0, 0, total_len);
+            size_t total_len = sess.cache_pos + seq_len;
+            auto k_full = sess.k_cache[layer]->slice(0, 0, total_len);
+            auto v_full = sess.v_cache[layer]->slice(0, 0, total_len);
 
             // Self attention
             auto attn_out = Tensor::create({seq_len, meta.nh, meta.dh}, meta.dtype, device);
@@ -236,13 +253,13 @@ struct Qwen2Model {
         ops::linear(logits, last_flat->view({1, meta.hs}), out_embed, nullptr);
 
         // 更新 cache 位置并返回设备端 logits
-        cache_pos += seq_len;
+        sess.cache_pos += seq_len;
         return logits->view({meta.voc});
     }
 
     // ── Argmax 贪心解码（原行为）──────────────────────────────────────────────
-    int64_t infer(int64_t *token_ids, size_t ntoken) {
-        auto logits_flat = run_forward(token_ids, ntoken);
+    int64_t infer(Qwen2Session &sess, int64_t *token_ids, size_t ntoken) {
+        auto logits_flat = run_forward(sess, token_ids, ntoken);
         auto max_idx = Tensor::create({1}, LLAISYS_DTYPE_I64, device);
         auto max_val = Tensor::create({1}, LLAISYS_DTYPE_F32, device);
         ops::argmax(max_idx, max_val, logits_flat);
@@ -278,7 +295,7 @@ struct Qwen2Model {
     }
 
     // ── Temperature / Top-K / Top-P 采样（CPU 端）───────────────────────────
-    int64_t sample_token(const std::vector<float> &logits,
+    int64_t sample_token(std::mt19937 &rng, const std::vector<float> &logits,
                          float temperature, int top_k, float top_p) {
         size_t voc = logits.size();
         // 贪心 argmax
@@ -333,19 +350,12 @@ struct Qwen2Model {
     }
 
     // ── 采样解码 ─────────────────────────────────────────────────────────────
-    int64_t infer_sample(int64_t *token_ids, size_t ntoken,
+    int64_t infer_sample(Qwen2Session &sess, int64_t *token_ids, size_t ntoken,
                          float temperature, int top_k, float top_p) {
-        auto logits_flat = run_forward(token_ids, ntoken);
+        auto logits_flat = run_forward(sess, token_ids, ntoken);
         std::vector<float> logits_cpu;
         logits_to_f32_cpu(logits_flat, logits_cpu);
-        return sample_token(logits_cpu, temperature, top_k, top_p);
-    }
-
-    void set_cache_pos(size_t pos) { cache_pos = pos; }
-    size_t get_cache_pos() const { return cache_pos; }
-
-    void reset_cache() {
-        cache_pos = 0;
+        return sample_token(sess.rng, logits_cpu, temperature, top_k, top_p);
     }
 };
 
@@ -405,28 +415,72 @@ struct LlaisysQwen2Weights *llaisysQwen2ModelWeights(struct LlaisysQwen2Model *m
     return weights;
 }
 
+// ─── 向后兼容接口：路由到模型内置的 default_session ──────────────────────────
+
 int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model *model_, int64_t *token_ids, size_t ntoken) {
     auto model = reinterpret_cast<llaisys::Qwen2Model *>(model_);
-    return model->infer(token_ids, ntoken);
+    return model->infer(*model->default_session, token_ids, ntoken);
 }
 
 int64_t llaisysQwen2ModelInferSample(struct LlaisysQwen2Model *model_,
                                      int64_t *token_ids, size_t ntoken,
                                      float temperature, int top_k, float top_p) {
-    return reinterpret_cast<llaisys::Qwen2Model *>(model_)->infer_sample(
-        token_ids, ntoken, temperature, top_k, top_p);
+    auto model = reinterpret_cast<llaisys::Qwen2Model *>(model_);
+    return model->infer_sample(*model->default_session, token_ids, ntoken,
+                               temperature, top_k, top_p);
 }
 
 void llaisysQwen2ModelSetCachePos(struct LlaisysQwen2Model *model_, size_t pos) {
-    reinterpret_cast<llaisys::Qwen2Model *>(model_)->set_cache_pos(pos);
+    reinterpret_cast<llaisys::Qwen2Model *>(model_)->default_session->set_pos(pos);
 }
 
 size_t llaisysQwen2ModelGetCachePos(struct LlaisysQwen2Model *model_) {
-    return reinterpret_cast<llaisys::Qwen2Model *>(model_)->get_cache_pos();
+    return reinterpret_cast<llaisys::Qwen2Model *>(model_)->default_session->get_pos();
 }
 
 void llaisysQwen2ModelResetCache(struct LlaisysQwen2Model *model_) {
-    reinterpret_cast<llaisys::Qwen2Model *>(model_)->reset_cache();
+    reinterpret_cast<llaisys::Qwen2Model *>(model_)->default_session->reset();
+}
+
+// ─── 多用户 Session API ───────────────────────────────────────────────────────
+
+struct LlaisysQwen2Session *llaisysQwen2SessionCreate(struct LlaisysQwen2Model *model_) {
+    auto model = reinterpret_cast<llaisys::Qwen2Model *>(model_);
+    auto sess = new llaisys::Qwen2Session(model->meta, model->device);
+    return reinterpret_cast<LlaisysQwen2Session *>(sess);
+}
+
+void llaisysQwen2SessionDestroy(struct LlaisysQwen2Session *sess_) {
+    delete reinterpret_cast<llaisys::Qwen2Session *>(sess_);
+}
+
+int64_t llaisysQwen2SessionInfer(struct LlaisysQwen2Model *model_,
+                                 struct LlaisysQwen2Session *sess_,
+                                 int64_t *token_ids, size_t ntoken) {
+    auto model = reinterpret_cast<llaisys::Qwen2Model *>(model_);
+    auto sess = reinterpret_cast<llaisys::Qwen2Session *>(sess_);
+    return model->infer(*sess, token_ids, ntoken);
+}
+
+int64_t llaisysQwen2SessionInferSample(struct LlaisysQwen2Model *model_,
+                                       struct LlaisysQwen2Session *sess_,
+                                       int64_t *token_ids, size_t ntoken,
+                                       float temperature, int top_k, float top_p) {
+    auto model = reinterpret_cast<llaisys::Qwen2Model *>(model_);
+    auto sess = reinterpret_cast<llaisys::Qwen2Session *>(sess_);
+    return model->infer_sample(*sess, token_ids, ntoken, temperature, top_k, top_p);
+}
+
+void llaisysQwen2SessionSetCachePos(struct LlaisysQwen2Session *sess_, size_t pos) {
+    reinterpret_cast<llaisys::Qwen2Session *>(sess_)->set_pos(pos);
+}
+
+size_t llaisysQwen2SessionGetCachePos(struct LlaisysQwen2Session *sess_) {
+    return reinterpret_cast<llaisys::Qwen2Session *>(sess_)->get_pos();
+}
+
+void llaisysQwen2SessionResetCache(struct LlaisysQwen2Session *sess_) {
+    reinterpret_cast<llaisys::Qwen2Session *>(sess_)->reset();
 }
 
 } // extern "C"

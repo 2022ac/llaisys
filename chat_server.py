@@ -11,12 +11,14 @@ LLAISYS Chat Server — OpenAI-compatible /v1/chat/completions 接口
 """
 
 import argparse
+import asyncio
 import json
+import threading
 import time
 import uuid
 import sys
 import os
-from typing import List, Optional, Iterator
+from typing import AsyncIterator, Dict, List, Optional, Iterator
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
@@ -45,29 +47,28 @@ class ChatCompletionRequest(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# KV-Cache 前缀匹配引擎
+# 用户会话：独立 KV-Cache + 前缀复用逻辑
 # ─────────────────────────────────────────────────────────────────────────────
 
-class ChatEngine:
+class UserSession:
     """
-    单模型聊天引擎，支持跨请求 KV-Cache 前缀复用。
+    一个用户的完整会话状态。
 
-    设计：
-    - 维护 _cached_tokens：当前模型 KV-Cache 对应的 token 序列
-    - 每次请求时，计算新 prompt 与 _cached_tokens 的最长公共前缀
-    - 只处理差量 token，复用已缓存的 KV 状态
-    - 单用户假设：无并发锁，每请求串行执行
+    - model_session : Qwen2Session，拥有独立 KV-Cache（隔离于其他用户）
+    - lock          : asyncio.Lock，同一会话同一时刻只允许一个推理请求
+    - cached_tokens : 当前 KV-Cache 对应的完整 token 序列，用于前缀复用
     """
 
-    def __init__(self, model, tokenizer):
-        self.model = model
+    def __init__(self, model_session, tokenizer):
+        self.model_session = model_session  # Qwen2Session
         self.tokenizer = tokenizer
-        # 当前 KV-Cache 对应的完整 token 序列（含 prompt 和已生成部分）
-        self._cached_tokens: List[int] = []
+        self.lock = asyncio.Lock()
+        self.cached_tokens: List[int] = []
 
     # ── 辅助 ──────────────────────────────────────────────────────────────────
 
-    def _common_prefix_len(self, a: List[int], b: List[int]) -> int:
+    @staticmethod
+    def _common_prefix_len(a: List[int], b: List[int]) -> int:
         n = min(len(a), len(b))
         for i in range(n):
             if a[i] != b[i]:
@@ -81,71 +82,46 @@ class ChatEngine:
         )
         return self.tokenizer.encode(prompt)
 
-    # ── 核心生成 ─────────────────────────────────────────────────────────────
+    # ── 核心生成（同步，在推理线程中运行）────────────────────────────────────
 
-    def _prepare_and_stream(
+    def _stream_tokens_sync(
         self,
         messages: List[Message],
         max_tokens: int,
         temperature: float,
         top_k: int,
         top_p: float,
-    ) -> Iterator[int]:
+    ) -> Iterator[tuple]:
         """
-        执行带前缀匹配的增量推理，yield 生成的 token IDs。
-        调用者负责检测 EOS 并停止迭代。
+        同步生成器，yield (token_id, text_delta)。
+        使用"全量 decode 做差"方法避免 BPE 边界乱码。
+        在独立 OS 线程中调用；thread_local CUDA Context 确保并发隔离。
         """
         prompt_tokens = self._tokenize(messages)
+        prefix_len = self._common_prefix_len(self.cached_tokens, prompt_tokens)
 
-        # 前缀匹配：找出与当前 KV-Cache 的公共前缀长度
-        prefix_len = self._common_prefix_len(self._cached_tokens, prompt_tokens)
+        # KV-Cache 前缀复用：回退到公共前缀末尾
+        if prefix_len < len(self.cached_tokens):
+            self.model_session.cache_pos = prefix_len
 
-        # 将 cache_pos 回退到公共前缀末尾
-        if prefix_len < len(self._cached_tokens):
-            self.model.cache_pos = prefix_len
-
-        # 只处理新增 token
         new_tokens = prompt_tokens[prefix_len:]
         if not new_tokens:
-            # 极少数情况：prompt 完全已在缓存中，不应发生
             return
 
+        accumulated_ids: List[int] = []
+        text_so_far = ""
         generated_ids: List[int] = []
-        for token_id in self.model.stream_generate(
+
+        for token_id in self.model_session.stream_generate(
             new_tokens,
             max_new_tokens=max_tokens,
             top_k=top_k,
             top_p=top_p,
             temperature=temperature,
         ):
-            generated_ids.append(token_id)
-            yield token_id
-            if token_id == self.tokenizer.eos_token_id:
-                break
-
-        # 更新全局缓存 token 序列
-        self._cached_tokens = prompt_tokens + generated_ids
-
-    def stream_text(
-        self,
-        messages: List[Message],
-        max_tokens: int,
-        temperature: float,
-        top_k: int,
-        top_p: float,
-    ) -> Iterator[str]:
-        """
-        yield 增量文本片段（正确处理多 token Unicode 字符）。
-        使用"全量 decode 做差"方法，避免 BPE 边界产生乱码。
-        """
-        accumulated_ids: List[int] = []
-        text_so_far = ""
-
-        for token_id in self._prepare_and_stream(
-            messages, max_tokens, temperature, top_k, top_p
-        ):
             accumulated_ids.append(token_id)
-            # 全量 decode，与上次相比取差量
+            generated_ids.append(token_id)
+
             new_text = self.tokenizer.decode(
                 accumulated_ids,
                 skip_special_tokens=True,
@@ -153,26 +129,57 @@ class ChatEngine:
             )
             delta = new_text[len(text_so_far):]
             text_so_far = new_text
-            if delta:
-                yield delta
+            yield token_id, delta
 
-    def generate_text(
-        self,
-        messages: List[Message],
-        max_tokens: int,
-        temperature: float,
-        top_k: int,
-        top_p: float,
-    ) -> str:
-        """阻塞式生成，返回完整回复文本。"""
-        return "".join(
-            self.stream_text(messages, max_tokens, temperature, top_k, top_p)
-        )
+        # 推理完成后更新前缀缓存
+        self.cached_tokens = prompt_tokens + generated_ids
 
-    def clear_cache(self):
-        """清空 KV-Cache（强制下次请求从头重算）。"""
-        self.model.reset_cache()
-        self._cached_tokens = []
+    def clear(self):
+        """清空 KV-Cache，重置前缀缓存。"""
+        self.model_session.reset_cache()
+        self.cached_tokens = []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ModelServer：多用户 Session 池
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ModelServer:
+    """
+    多用户推理服务核心。
+
+    - 每个 session_id 对应一个独立 UserSession（独立 KV-Cache）
+    - 不同 session 的推理并发在不同线程执行（每线程独立 CUDA stream）
+    - 同一 session 内请求通过 asyncio.Lock 串行化，避免 KV-Cache 竞争
+    """
+
+    def __init__(self, model, tokenizer):
+        self.model = model
+        self.tokenizer = tokenizer
+        self._sessions: Dict[str, UserSession] = {}
+        self._sessions_mu = threading.Lock()  # 保护 _sessions dict
+
+    def get_or_create_session(self, session_id: str) -> UserSession:
+        with self._sessions_mu:
+            if session_id not in self._sessions:
+                model_session = self.model.create_session()
+                self._sessions[session_id] = UserSession(model_session, self.tokenizer)
+            return self._sessions[session_id]
+
+    def delete_session(self, session_id: str):
+        with self._sessions_mu:
+            if session_id in self._sessions:
+                self._sessions[session_id].clear()
+                del self._sessions[session_id]
+
+    def clear_session(self, session_id: str):
+        with self._sessions_mu:
+            if session_id in self._sessions:
+                self._sessions[session_id].clear()
+
+    def session_count(self) -> int:
+        with self._sessions_mu:
+            return len(self._sessions)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -505,8 +512,8 @@ newSession();
 # FastAPI 应用
 # ─────────────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="LLAISYS Chat Server", version="0.1.0")
-_engine: Optional["ChatEngine"] = None
+app = FastAPI(title="LLAISYS Chat Server", version="0.2.0")
+_server: Optional[ModelServer] = None
 
 
 def _make_sse_chunk(content: str, chat_id: str, model: str) -> str:
@@ -531,36 +538,76 @@ def _make_sse_done(chat_id: str, model: str) -> str:
     return f"data: {json.dumps(data)}\n\ndata: [DONE]\n\n"
 
 
+async def _sse_stream(
+    user_session: UserSession,
+    request: "ChatCompletionRequest",
+    chat_id: str,
+) -> AsyncIterator[str]:
+    """
+    异步 SSE 生成器。
+
+    将同步推理放入单独 OS 线程，通过 asyncio.Queue 将
+    token 流传回事件循环。每个线程拥有独立的
+    thread_local Context（独立 CUDA stream），不同 session 完全并发。
+    """
+    loop = asyncio.get_event_loop()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+
+    def worker():
+        try:
+            for _, delta in user_session._stream_tokens_sync(
+                request.messages,
+                request.max_tokens,
+                request.temperature,
+                request.top_k,
+                request.top_p,
+            ):
+                asyncio.run_coroutine_threadsafe(queue.put(("delta", delta)), loop)
+        except Exception as exc:
+            asyncio.run_coroutine_threadsafe(queue.put(("error", str(exc))), loop)
+        finally:
+            asyncio.run_coroutine_threadsafe(queue.put(("done", None)), loop)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+    while True:
+        kind, data = await queue.get()
+        if kind == "done":
+            yield _make_sse_done(chat_id, request.model)
+            break
+        if kind == "error":
+            yield _make_sse_chunk(f"[Error: {data}]", chat_id, request.model)
+            yield _make_sse_done(chat_id, request.model)
+            break
+        if kind == "delta" and data:
+            yield _make_sse_chunk(data, chat_id, request.model)
+
+    thread.join(timeout=5.0)
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return WEB_UI_HTML
 
 
 @app.post("/v1/chat/completions")
-def chat_completions(request: ChatCompletionRequest):
-    if _engine is None:
+async def chat_completions(request: ChatCompletionRequest):
+    if _server is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    sid = request.session_id or "default"
+    user_session = _server.get_or_create_session(sid)
 
     if request.stream:
-        def token_stream():
-            try:
-                for text in _engine.stream_text(
-                    request.messages,
-                    request.max_tokens,
-                    request.temperature,
-                    request.top_k,
-                    request.top_p,
-                ):
-                    yield _make_sse_chunk(text, chat_id, request.model)
-            except Exception as e:
-                err_chunk = _make_sse_chunk(f"[Server Error: {e}]", chat_id, request.model)
-                yield err_chunk
-            yield _make_sse_done(chat_id, request.model)
+        async def locked_stream():
+            async with user_session.lock:
+                async for chunk in _sse_stream(user_session, request, chat_id):
+                    yield chunk
 
         return StreamingResponse(
-            token_stream(),
+            locked_stream(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -569,13 +616,18 @@ def chat_completions(request: ChatCompletionRequest):
             },
         )
     else:
-        reply = _engine.generate_text(
-            request.messages,
-            request.max_tokens,
-            request.temperature,
-            request.top_k,
-            request.top_p,
-        )
+        def blocking_generate():
+            parts = []
+            for _, delta in user_session._stream_tokens_sync(
+                request.messages, request.max_tokens,
+                request.temperature, request.top_k, request.top_p,
+            ):
+                parts.append(delta)
+            return "".join(parts)
+
+        async with user_session.lock:
+            reply = await asyncio.to_thread(blocking_generate)
+
         return JSONResponse({
             "id": chat_id,
             "object": "chat.completion",
@@ -592,15 +644,33 @@ def chat_completions(request: ChatCompletionRequest):
 
 @app.get("/v1/models")
 def list_models():
-    return {"object": "list", "data": [{"id": "llaisys", "object": "model"}]}
+    return {"object": "list", "data": [
+        {"id": "llaisys", "object": "model",
+         "active_sessions": _server.session_count() if _server else 0}
+    ]}
 
 
 @app.post("/v1/sessions/{session_id}/clear")
 def clear_session(session_id: str):
-    """清除 KV-Cache（用于会话切换时强制重算）。"""
-    if _engine is not None:
-        _engine.clear_cache()
+    """清除指定会话的 KV-Cache（会话切换时调用）。"""
+    if _server is not None:
+        _server.clear_session(session_id)
     return {"status": "ok", "session_id": session_id}
+
+
+@app.delete("/v1/sessions/{session_id}")
+def delete_session(session_id: str):
+    """彻底删除会话并释放其 KV-Cache 内存。"""
+    if _server is not None:
+        _server.delete_session(session_id)
+    return {"status": "deleted", "session_id": session_id}
+
+
+@app.get("/v1/sessions")
+def list_sessions():
+    """查看当前活跃会话数量。"""
+    count = _server.session_count() if _server else 0
+    return {"active_sessions": count}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -608,10 +678,10 @@ def clear_session(session_id: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    global _engine
+    global _server
 
     parser = argparse.ArgumentParser(
-        description="LLAISYS Chat Server (OpenAI-compatible)"
+        description="LLAISYS Chat Server (OpenAI-compatible, multi-user)"
     )
     parser.add_argument("--model", required=True, help="模型目录路径")
     parser.add_argument("--device", default="cpu", choices=["cpu", "nvidia"])
@@ -619,7 +689,6 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
-    # 延迟导入以避免在 import 时就加载模型
     import llaisys
     from llaisys import DeviceType
     from transformers import AutoTokenizer
@@ -633,8 +702,9 @@ def main():
     model = llaisys.models.Qwen2(args.model, device)
     print("[server] 模型加载完成。")
 
-    _engine = ChatEngine(model, tokenizer)
+    _server = ModelServer(model, tokenizer)
 
+    print(f"[server] 多用户模式已启动: 每个 session_id 拥有独立 KV-Cache")
     print(f"[server] 监听 http://{args.host}:{args.port}")
     print(f"[server] Web UI: http://localhost:{args.port}/")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

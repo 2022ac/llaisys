@@ -41,6 +41,7 @@ class LlaisysQwen2Weights(Structure):
 
 
 llaisysQwen2Model_t = c_void_p
+llaisysQwen2Session_t = c_void_p
 
 
 def load_qwen2(lib):
@@ -61,33 +62,44 @@ def load_qwen2(lib):
     lib.llaisysQwen2ModelWeights.argtypes = [llaisysQwen2Model_t]
     lib.llaisysQwen2ModelWeights.restype = POINTER(LlaisysQwen2Weights)
 
-    # llaisysQwen2ModelInfer
-    lib.llaisysQwen2ModelInfer.argtypes = [
-        llaisysQwen2Model_t,
-        POINTER(c_int64),
-        c_size_t,
-    ]
+    # ── 向后兼容：默认 session ────────────────────────────────────────────────
+    lib.llaisysQwen2ModelInfer.argtypes = [llaisysQwen2Model_t, POINTER(c_int64), c_size_t]
     lib.llaisysQwen2ModelInfer.restype = c_int64
 
-    # llaisysQwen2ModelInferSample
     lib.llaisysQwen2ModelInferSample.argtypes = [
-        llaisysQwen2Model_t,
-        POINTER(c_int64),
-        c_size_t,
-        c_float,  # temperature
-        c_int,    # top_k
-        c_float,  # top_p
-    ]
+        llaisysQwen2Model_t, POINTER(c_int64), c_size_t, c_float, c_int, c_float]
     lib.llaisysQwen2ModelInferSample.restype = c_int64
 
-    # llaisysQwen2ModelSetCachePos
     lib.llaisysQwen2ModelSetCachePos.argtypes = [llaisysQwen2Model_t, c_size_t]
     lib.llaisysQwen2ModelSetCachePos.restype = None
 
-    # llaisysQwen2ModelGetCachePos
     lib.llaisysQwen2ModelGetCachePos.argtypes = [llaisysQwen2Model_t]
     lib.llaisysQwen2ModelGetCachePos.restype = c_size_t
 
-    # llaisysQwen2ModelResetCache
     lib.llaisysQwen2ModelResetCache.argtypes = [llaisysQwen2Model_t]
     lib.llaisysQwen2ModelResetCache.restype = None
+
+    # ── 多用户 Session API ────────────────────────────────────────────────────
+    lib.llaisysQwen2SessionCreate.argtypes = [llaisysQwen2Model_t]
+    lib.llaisysQwen2SessionCreate.restype = llaisysQwen2Session_t
+
+    lib.llaisysQwen2SessionDestroy.argtypes = [llaisysQwen2Session_t]
+    lib.llaisysQwen2SessionDestroy.restype = None
+
+    lib.llaisysQwen2SessionInfer.argtypes = [
+        llaisysQwen2Model_t, llaisysQwen2Session_t, POINTER(c_int64), c_size_t]
+    lib.llaisysQwen2SessionInfer.restype = c_int64
+
+    lib.llaisysQwen2SessionInferSample.argtypes = [
+        llaisysQwen2Model_t, llaisysQwen2Session_t,
+        POINTER(c_int64), c_size_t, c_float, c_int, c_float]
+    lib.llaisysQwen2SessionInferSample.restype = c_int64
+
+    lib.llaisysQwen2SessionSetCachePos.argtypes = [llaisysQwen2Session_t, c_size_t]
+    lib.llaisysQwen2SessionSetCachePos.restype = None
+
+    lib.llaisysQwen2SessionGetCachePos.argtypes = [llaisysQwen2Session_t]
+    lib.llaisysQwen2SessionGetCachePos.restype = c_size_t
+
+    lib.llaisysQwen2SessionResetCache.argtypes = [llaisysQwen2Session_t]
+    lib.llaisysQwen2SessionResetCache.restype = None
